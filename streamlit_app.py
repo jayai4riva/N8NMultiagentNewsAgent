@@ -167,6 +167,14 @@ def keyword_search(index: pd.DataFrame, terms, limit: int = 30) -> pd.DataFrame:
     return top.drop(columns=["kscore_raw", "text_lower"], errors="ignore")
 
 
+def extract_text(response, fallback: str = "") -> str:
+    """Return only the text from a Claude response.
+    Newer models can return ThinkingBlocks (or tool blocks) before the text, so
+    response.content[0].text is not safe. Keep TextBlocks only and join them."""
+    text_blocks = [c for c in (response.content or []) if getattr(c, "type", None) == "text"]
+    return "\n".join(b.text for b in text_blocks).strip() if text_blocks else fallback
+
+
 # ───────────────────────────── RAG steps ─────────────────────────────
 def plan_query(question: str, previous: str | None):
     """Step 1 – interpret the question: rewrite it, infer categories and a time range."""
@@ -182,7 +190,7 @@ Return ONLY JSON, no markdown:
 Date rules: "today" = today; "yesterday"; "this week" = Monday of this week to today; "last N days"; "this month" = 1st of month to today. If the question has no time reference, use null for both."""
     try:
         msg = claude.messages.create(model=FAST_MODEL, max_tokens=300, messages=[{"role": "user", "content": prompt}])
-        plan = json.loads(re.search(r"\{.*\}", msg.content[0].text, re.S).group(0))
+        plan = json.loads(re.search(r"\{.*\}", extract_text(msg), re.S).group(0))
     except Exception:
         plan = {}
     plan.setdefault("search_query", question)
@@ -274,6 +282,7 @@ with st.sidebar:
     if st.button("🧹 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
+    st.caption("App version 1.1 (thinking-safe)")
     st.caption(f"Collection: `{COLLECTION}` · Models: {CHAT_MODEL.split('-')[1].title()} + Gemini embeddings")
 
 sidebar_start, sidebar_end = (date_range if isinstance(date_range, tuple) and len(date_range) == 2
@@ -366,7 +375,7 @@ with tab_brief:
                           "If a category has no articles write 'No new stories.'\n\n" + "\n".join(lines))
                 with st.spinner("Writing the briefing…"):
                     msg = claude.messages.create(model=CHAT_MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
-                st.session_state[f"brief_{bdate}"] = msg.content[0].text
+                st.session_state[f"brief_{bdate}"] = extract_text(msg, "The model returned no text. Please try again.")
         except Exception as e:
             st.error(f"Couldn't build the briefing: {type(e).__name__}: {e}")
     if st.session_state.get(f"brief_{bdate}"):
