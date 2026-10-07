@@ -6,7 +6,7 @@ Reads the Qdrant collection `news_kb` that the n8n workflow fills every morning
 published_date, entities, also_reported_by, chunk_index).
 
 Tabs
-  💬 Ask             – RAG chat: plan query → hybrid retrieve → rerank (recency) → Claude answer with citations
+  💬 Ask             – RAG chat: plan query → hybrid retrieve → rerank (recency) → Gemini answer with citations
   ☀️ Today's Briefing – briefing for any date, generated from stored articles
   🩺 Pipeline Health – freshness check + n8n run log + error status
 """
@@ -20,8 +20,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from anthropic import Anthropic
 from google import genai
+from google.genai import types
 from qdrant_client import QdrantClient
 
 # ───────────────────────────── configuration ─────────────────────────────
@@ -31,7 +31,7 @@ IST = ZoneInfo("Asia/Kolkata")
 CATEGORIES = ["Technology", "Finance", "Politics"]
 CAT_ICON = {"Technology": "💻", "Finance": "📈", "Politics": "🏛️"}
 EMBED_MODEL = "gemini-embedding-001"          # must match the n8n Gemini Embeddings node
-REQUIRED = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY"]
+REQUIRED = ["GEMINI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY"]
 
 
 def secret(key, default=None):
@@ -42,8 +42,9 @@ def secret(key, default=None):
 
 
 COLLECTION = secret("QDRANT_COLLECTION", "news_kb")
-CHAT_MODEL = secret("CLAUDE_CHAT_MODEL", "claude-sonnet-5-5")
-FAST_MODEL = secret("CLAUDE_FAST_MODEL", "claude-haiku-4-5-20251001")
+# Free-tier Gemini models (change in Secrets if Google renames or retires a model)
+CHAT_MODEL = secret("GEMINI_CHAT_MODEL", "gemini-3.6-flash")        # answers + briefing
+FAST_MODEL = secret("GEMINI_FAST_MODEL", "gemini-3.5-flash-lite")   # query planning
 MIN_SCORE = float(secret("MIN_RELEVANCE_SCORE", 0.55))   # below this, the vector match is treated as "not about this"
 RUNLOG_CSV_URL = secret("RUNLOG_CSV_URL", "")             # optional: Google Sheet "RunLog" published as CSV
 
@@ -91,12 +92,11 @@ if missing:
 
 @st.cache_resource
 def get_clients():
-    return (Anthropic(api_key=secret("ANTHROPIC_API_KEY")),
-            genai.Client(api_key=secret("GEMINI_API_KEY")),
+    return (genai.Client(api_key=secret("GEMINI_API_KEY")),
             QdrantClient(url=secret("QDRANT_URL"), api_key=secret("QDRANT_API_KEY"), timeout=30))
 
 
-claude, gem, qdrant = get_clients()
+gem, qdrant = get_clients()
 
 
 # ───────────────────────────── data access ─────────────────────────────
@@ -167,12 +167,19 @@ def keyword_search(index: pd.DataFrame, terms, limit: int = 30) -> pd.DataFrame:
     return top.drop(columns=["kscore_raw", "text_lower"], errors="ignore")
 
 
-def extract_text(response, fallback: str = "") -> str:
-    """Return only the text from a Claude response.
-    Newer models can return ThinkingBlocks (or tool blocks) before the text, so
-    response.content[0].text is not safe. Keep TextBlocks only and join them."""
-    text_blocks = [c for c in (response.content or []) if getattr(c, "type", None) == "text"]
-    return "\n".join(b.text for b in text_blocks).strip() if text_blocks else fallback
+def gemini_text(prompt: str, model: str, temperature: float = 0.2, system: str | None = None, fallback: str = "") -> str:
+    """One Gemini call that returns only the answer text (thinking parts are never included)."""
+    cfg = types.GenerateContentConfig(system_instruction=system, temperature=temperature)
+    resp = gem.models.generate_content(model=model, contents=prompt, config=cfg)
+    return (resp.text or "").strip() or fallback
+
+
+def is_rate_limit(err: Exception) -> bool:
+    msg = str(err)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+
+
+RATE_LIMIT_MSG = "The free Gemini limit was reached for this minute. Please wait about a minute and try again."
 
 
 # ───────────────────────────── RAG steps ─────────────────────────────
@@ -189,8 +196,7 @@ Return ONLY JSON, no markdown:
   "start_date": "YYYY-MM-DD" or null, "end_date": "YYYY-MM-DD" or null}}
 Date rules: "today" = today; "yesterday"; "this week" = Monday of this week to today; "last N days"; "this month" = 1st of month to today. If the question has no time reference, use null for both."""
     try:
-        msg = claude.messages.create(model=FAST_MODEL, max_tokens=300, messages=[{"role": "user", "content": prompt}])
-        plan = json.loads(re.search(r"\{.*\}", extract_text(msg), re.S).group(0))
+        plan = json.loads(re.search(r"\{.*\}", gemini_text(prompt, FAST_MODEL, temperature=0), re.S).group(0))
     except Exception:
         plan = {}
     plan.setdefault("search_query", question)
@@ -249,11 +255,17 @@ def build_context(hits: pd.DataFrame) -> str:
 
 def stream_answer(question, hits, window, history):
     system = ANSWER_SYSTEM.format(today=f"{today_ist():%A, %d %B %Y}", window=window)
-    messages = [{"role": m["role"], "content": m["content"]} for m in history[-4:]]
-    messages.append({"role": "user", "content": f"News excerpts:\n\n{build_context(hits)}\n\nQuestion: {question}"})
-    with claude.messages.stream(model=CHAT_MODEL, max_tokens=1200, system=system, messages=messages) as stream:
-        for text in stream.text_stream:
-            yield text
+    recent = history[-4:]
+    while recent and recent[0]["role"] != "user":          # Gemini conversations must start with the user
+        recent = recent[1:]
+    contents = [types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
+                for m in recent]
+    contents.append(types.Content(role="user", parts=[types.Part(
+        text=f"News excerpts:\n\n{build_context(hits)}\n\nQuestion: {question}")]))
+    cfg = types.GenerateContentConfig(system_instruction=system, temperature=0.2)
+    for chunk in gem.models.generate_content_stream(model=CHAT_MODEL, contents=contents, config=cfg):
+        if chunk.text:
+            yield chunk.text
 
 
 def render_sources(answer: str, hits: pd.DataFrame):
@@ -282,8 +294,8 @@ with st.sidebar:
     if st.button("🧹 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
-    st.caption("App version 1.1 (thinking-safe)")
-    st.caption(f"Collection: `{COLLECTION}` · Models: {CHAT_MODEL.split('-')[1].title()} + Gemini embeddings")
+    st.caption("App version 1.2 (Gemini free tier)")
+    st.caption(f"Collection: `{COLLECTION}` · Models: {CHAT_MODEL} / {FAST_MODEL} + {EMBED_MODEL}")
 
 sidebar_start, sidebar_end = (date_range if isinstance(date_range, tuple) and len(date_range) == 2
                               else (default_range[0], default_range[1]))
@@ -345,7 +357,8 @@ with tab_ask:
                         with st.expander(f"Sources ({len(sources)})", expanded=True):
                             st.markdown("\n\n".join(sources))
             except Exception as e:
-                answer, sources = "Sorry — something went wrong while searching. Please try again in a moment.", []
+                answer, sources = (RATE_LIMIT_MSG if is_rate_limit(e)
+                                   else "Sorry — something went wrong while searching. Please try again in a moment."), []
                 st.error(answer)
                 with st.expander("Technical details"):
                     st.code(f"{type(e).__name__}: {e}")
@@ -374,10 +387,10 @@ with tab_brief:
                           "a bold one-line headline, one 'Why it matters' sentence, and a markdown link [Source](url). "
                           "If a category has no articles write 'No new stories.'\n\n" + "\n".join(lines))
                 with st.spinner("Writing the briefing…"):
-                    msg = claude.messages.create(model=CHAT_MODEL, max_tokens=2000, messages=[{"role": "user", "content": prompt}])
-                st.session_state[f"brief_{bdate}"] = extract_text(msg, "The model returned no text. Please try again.")
+                    st.session_state[f"brief_{bdate}"] = gemini_text(prompt, CHAT_MODEL, temperature=0.3,
+                                                                    fallback="The model returned no text. Please try again.")
         except Exception as e:
-            st.error(f"Couldn't build the briefing: {type(e).__name__}: {e}")
+            st.error(RATE_LIMIT_MSG if is_rate_limit(e) else f"Couldn't build the briefing: {type(e).__name__}: {e}")
     if st.session_state.get(f"brief_{bdate}"):
         st.markdown(st.session_state[f"brief_{bdate}"])
 
