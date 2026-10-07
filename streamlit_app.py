@@ -12,6 +12,7 @@ Tabs
 """
 
 import hmac
+import time
 import json
 import math
 import re
@@ -45,6 +46,7 @@ COLLECTION = secret("QDRANT_COLLECTION", "news_kb")
 # Free-tier Gemini models (change in Secrets if Google renames or retires a model)
 CHAT_MODEL = secret("GEMINI_CHAT_MODEL", "gemini-3.6-flash")        # answers + briefing
 FAST_MODEL = secret("GEMINI_FAST_MODEL", "gemini-3.5-flash-lite")   # query planning
+FALLBACK_MODEL = secret("GEMINI_FALLBACK_MODEL", FAST_MODEL)          # used when the main model is busy (503)
 MIN_SCORE = float(secret("MIN_RELEVANCE_SCORE", 0.55))   # below this, the vector match is treated as "not about this"
 RUNLOG_CSV_URL = secret("RUNLOG_CSV_URL", "")             # optional: Google Sheet "RunLog" published as CSV
 
@@ -167,19 +169,40 @@ def keyword_search(index: pd.DataFrame, terms, limit: int = 30) -> pd.DataFrame:
     return top.drop(columns=["kscore_raw", "text_lower"], errors="ignore")
 
 
-def gemini_text(prompt: str, model: str, temperature: float = 0.2, system: str | None = None, fallback: str = "") -> str:
-    """One Gemini call that returns only the answer text (thinking parts are never included)."""
-    cfg = types.GenerateContentConfig(system_instruction=system, temperature=temperature)
-    resp = gem.models.generate_content(model=model, contents=prompt, config=cfg)
-    return (resp.text or "").strip() or fallback
-
-
 def is_rate_limit(err: Exception) -> bool:
     msg = str(err)
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
 
 
-RATE_LIMIT_MSG = "The free Gemini limit was reached for this minute. Please wait about a minute and try again."
+def is_busy(err: Exception) -> bool:
+    msg = str(err)
+    return "503" in msg or "UNAVAILABLE" in msg or "overloaded" in msg.lower() or "high demand" in msg.lower()
+
+
+def models_to_try(model: str):
+    return [model] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != model else [])
+
+
+def gemini_text(prompt: str, model: str, temperature: float = 0.2, system: str | None = None, fallback: str = "") -> str:
+    """One Gemini call that returns only the answer text. If Google is busy (503) or the
+    per-minute limit is hit (429), it waits and retries, then tries the fallback model."""
+    cfg = types.GenerateContentConfig(system_instruction=system, temperature=temperature)
+    last = None
+    for m in models_to_try(model):
+        for attempt in range(3):
+            try:
+                resp = gem.models.generate_content(model=m, contents=prompt, config=cfg)
+                return (resp.text or "").strip() or fallback
+            except Exception as e:
+                last = e
+                if not (is_busy(e) or is_rate_limit(e)):
+                    raise
+                time.sleep(2 * (attempt + 1))        # 2s, 4s, 6s
+    raise last
+
+
+RATE_LIMIT_MSG = ("Google's Gemini service is busy or the free per-minute limit was reached. "
+                  "Please wait about a minute and try again.")
 
 
 # ───────────────────────────── RAG steps ─────────────────────────────
@@ -263,9 +286,22 @@ def stream_answer(question, hits, window, history):
     contents.append(types.Content(role="user", parts=[types.Part(
         text=f"News excerpts:\n\n{build_context(hits)}\n\nQuestion: {question}")]))
     cfg = types.GenerateContentConfig(system_instruction=system, temperature=0.2)
-    for chunk in gem.models.generate_content_stream(model=CHAT_MODEL, contents=contents, config=cfg):
-        if chunk.text:
-            yield chunk.text
+    last = None
+    for m in models_to_try(CHAT_MODEL):
+        for attempt in range(2):
+            started = False
+            try:
+                for chunk in gem.models.generate_content_stream(model=m, contents=contents, config=cfg):
+                    if chunk.text:
+                        started = True
+                        yield chunk.text
+                return
+            except Exception as e:
+                last = e
+                if started or not (is_busy(e) or is_rate_limit(e)):
+                    raise
+                time.sleep(2 * (attempt + 1))
+    raise last
 
 
 def render_sources(answer: str, hits: pd.DataFrame):
@@ -294,7 +330,7 @@ with st.sidebar:
     if st.button("🧹 Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
-    st.caption("App version 1.2 (Gemini free tier)")
+    st.caption("App version 1.3 (Gemini free tier, auto-retry)")
     st.caption(f"Collection: `{COLLECTION}` · Models: {CHAT_MODEL} / {FAST_MODEL} + {EMBED_MODEL}")
 
 sidebar_start, sidebar_end = (date_range if isinstance(date_range, tuple) and len(date_range) == 2
@@ -357,7 +393,7 @@ with tab_ask:
                         with st.expander(f"Sources ({len(sources)})", expanded=True):
                             st.markdown("\n\n".join(sources))
             except Exception as e:
-                answer, sources = (RATE_LIMIT_MSG if is_rate_limit(e)
+                answer, sources = (RATE_LIMIT_MSG if (is_rate_limit(e) or is_busy(e))
                                    else "Sorry — something went wrong while searching. Please try again in a moment."), []
                 st.error(answer)
                 with st.expander("Technical details"):
@@ -390,7 +426,7 @@ with tab_brief:
                     st.session_state[f"brief_{bdate}"] = gemini_text(prompt, CHAT_MODEL, temperature=0.3,
                                                                     fallback="The model returned no text. Please try again.")
         except Exception as e:
-            st.error(RATE_LIMIT_MSG if is_rate_limit(e) else f"Couldn't build the briefing: {type(e).__name__}: {e}")
+            st.error(RATE_LIMIT_MSG if (is_rate_limit(e) or is_busy(e)) else f"Couldn't build the briefing: {type(e).__name__}: {e}")
     if st.session_state.get(f"brief_{bdate}"):
         st.markdown(st.session_state[f"brief_{bdate}"])
 
